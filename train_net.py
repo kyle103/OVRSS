@@ -30,7 +30,12 @@ from detectron2.utils.file_io import PathManager
 import numpy as np
 from PIL import Image
 import glob
-
+if not hasattr(np, "int"):
+    np.int = int
+if not hasattr(np, "float"):
+    np.float = float
+if not hasattr(np, "bool"):
+    np.bool = bool
 import pycocotools.mask as mask_util
 
 from detectron2.data import DatasetCatalog, MetadataCatalog
@@ -56,10 +61,10 @@ class VOCbEvaluator(SemSegEvaluator):
         """
         for input, output in zip(inputs, outputs):
             output = output["sem_seg"].argmax(dim=0).to(self._cpu_device)
-            pred = np.array(output, dtype=np.int)
+            pred = np.array(output, dtype=int)  # 替换 np.int -> int
             pred[pred >= 20] = 20
             with PathManager.open(self.input_file_to_gt_file[input["file_name"]], "rb") as f:
-                gt = np.array(Image.open(f), dtype=np.int)
+                gt = np.array(Image.open(f), dtype=int)  # 替换 np.int -> int
 
             gt[gt == self._ignore_label] = self._num_classes
 

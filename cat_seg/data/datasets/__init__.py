@@ -9,4 +9,8 @@ from . import (
     register_DLRSD,
     register_Potsdam,
     register_Vaihingen,
+    register_LoveDA,
+    register_uavid,
+    register_UDD5,
+    register_VDD,
 )

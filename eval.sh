@@ -25,7 +25,7 @@ fi
 shift 3
 opts=${@}
 
-#iSAID_all
+# #iSAID_all
 python train_net.py --config $config \
  --num-gpus $gpus \
  --dist-url "auto" \
@@ -33,12 +33,12 @@ python train_net.py --config $config \
  OUTPUT_DIR $output/eval \
  MODEL.SEM_SEG_HEAD.TEST_CLASS_JSON "datasets/iSAID.json" \
  DATASETS.TEST \(\"iSAID_all_sem_seg\"\,\) \
- TEST.SLIDING_WINDOW "True" \
+ TEST.SLIDING_WINDOW "False" \
  MODEL.SEM_SEG_HEAD.POOLING_SIZES "[1,1]" \
  MODEL.WEIGHTS $output/model_final.pth \
  $opts
 
-#DLRSD_all
+# # #DLRSD_all
 python train_net.py --config $config \
  --num-gpus $gpus \
  --dist-url "auto" \
@@ -46,12 +46,12 @@ python train_net.py --config $config \
  OUTPUT_DIR $output/eval \
  MODEL.SEM_SEG_HEAD.TEST_CLASS_JSON "datasets/DLRSD.json" \
  DATASETS.TEST \(\"DLRSD_all_sem_seg\"\,\) \
- TEST.SLIDING_WINDOW "True" \
+ TEST.SLIDING_WINDOW "False" \
  MODEL.SEM_SEG_HEAD.POOLING_SIZES "[1,1]" \
  MODEL.WEIGHTS $output/model_final.pth \
  $opts
 
-#Postdam_all
+# # # #Postdam_all
 python train_net.py --config $config \
  --num-gpus $gpus \
  --dist-url "auto" \
@@ -59,13 +59,13 @@ python train_net.py --config $config \
  OUTPUT_DIR $output/eval \
  MODEL.SEM_SEG_HEAD.TEST_CLASS_JSON "datasets/Potsdam.json" \
  DATASETS.TEST \(\"Potsdam_all_sem_seg\"\,\) \
- TEST.SLIDING_WINDOW "True" \
+ TEST.SLIDING_WINDOW "False" \
  MODEL.SEM_SEG_HEAD.POOLING_SIZES "[1,1]" \
  MODEL.WEIGHTS $output/model_final.pth \
  $opts
 
 
-#Vaihingen_all
+# #Vaihingen_all
 python train_net.py --config $config \
  --num-gpus $gpus \
  --dist-url "auto" \
@@ -73,10 +73,62 @@ python train_net.py --config $config \
  OUTPUT_DIR $output/eval \
  MODEL.SEM_SEG_HEAD.TEST_CLASS_JSON "datasets/Vaihingen.json" \
  DATASETS.TEST \(\"Vaihingen_all_sem_seg\"\,\) \
+ TEST.SLIDING_WINDOW "False" \
+ MODEL.SEM_SEG_HEAD.POOLING_SIZES "[1,1]" \
+ MODEL.WEIGHTS $output/model_final.pth \
+ $opts
+
+
+# # # LoveDA_all
+python train_net.py --config $config \
+ --num-gpus $gpus \
+ --dist-url "auto" \
+ --eval-only \
+ OUTPUT_DIR $output/eval-LoveDA_noslide \
+ MODEL.SEM_SEG_HEAD.TEST_CLASS_JSON "datasets/LoveDA.json" \
+ DATASETS.TEST \(\"LoveDA_all_sem_seg\"\,\) \
  TEST.SLIDING_WINDOW "True" \
  MODEL.SEM_SEG_HEAD.POOLING_SIZES "[1,1]" \
  MODEL.WEIGHTS $output/model_final.pth \
  $opts
 
+# # # uavid_all
+python train_net.py --config $config \
+ --num-gpus $gpus \
+ --dist-url "auto" \
+ --eval-only \
+ OUTPUT_DIR $output/eval-uavid_noslide \
+ MODEL.SEM_SEG_HEAD.TEST_CLASS_JSON "datasets/uavid.json" \
+ DATASETS.TEST \(\"uavid_all_sem_seg\"\,\) \
+ TEST.SLIDING_WINDOW "True" \
+ MODEL.SEM_SEG_HEAD.POOLING_SIZES "[1,1]" \
+ MODEL.WEIGHTS $output/model_final.pth \
+ $opts
+
+# VDD_all
+python train_net.py --config $config \
+ --num-gpus $gpus \
+ --dist-url "auto" \
+ --eval-only \
+ OUTPUT_DIR $output/eval-VDD_noslide \
+ MODEL.SEM_SEG_HEAD.TEST_CLASS_JSON "datasets/VDD.json" \
+ DATASETS.TEST \(\"VDD_all_sem_seg\"\,\) \
+ TEST.SLIDING_WINDOW "True" \
+ MODEL.SEM_SEG_HEAD.POOLING_SIZES "[1,1]" \
+ MODEL.WEIGHTS $output/model_final.pth \
+ $opts
+
+ # UDD5_all
+python train_net.py --config $config \
+ --num-gpus $gpus \
+ --dist-url "auto" \
+ --eval-only \
+ OUTPUT_DIR $output/eval-UDD5_noslide \
+ MODEL.SEM_SEG_HEAD.TEST_CLASS_JSON "datasets/UDD5.json" \
+ DATASETS.TEST \(\"UDD5_all_sem_seg\"\,\) \
+ TEST.SLIDING_WINDOW "False" \
+ MODEL.SEM_SEG_HEAD.POOLING_SIZES "[1,1]" \
+ MODEL.WEIGHTS $output/model_final.pth \
+ $opts
 
 cat $output/eval/log.txt | grep copypaste

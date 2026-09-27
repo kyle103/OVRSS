@@ -43,5 +43,5 @@ def register_Potsdam(root):
             **meta,
         )
 
-root = "/code/OVS_datasets"
+root = "datasets/OVSISBenchDataset"
 register_Potsdam(root)

@@ -67,6 +67,16 @@ class CATSeg(nn.Module):
                         params.requires_grad = True
                     else:
                         params.requires_grad = False
+
+                elif clip_finetune == "hyperbolic":
+                    if "adapter" in name:
+                        # QV fine-tuning for attention blocks
+                        #print(name)
+                        params.requires_grad = True #if "q_proj" in name or "v_proj" in name else False
+                    elif "position" in name:
+                        params.requires_grad = True
+                    else:
+                        params.requires_grad = False
                 elif clip_finetune == "full":
                     params.requires_grad = True
                 else:
@@ -144,7 +154,20 @@ class CATSeg(nn.Module):
         self.layers = []
 
         clip_images_resized = F.interpolate(clip_images.tensor, size=self.clip_resolution, mode='bilinear', align_corners=False, )
+
+
+        # 旋转90度
+        clip_images_resized_90 = torch.rot90(clip_images_resized, k=1, dims=(2, 3))
+        # 旋转180度
+        clip_images_resized_180  = torch.rot90(clip_images_resized, k=2, dims=(2, 3))
+        # 旋转270度
+        clip_images_resized_270 = torch.rot90(clip_images_resized, k=3, dims=(2, 3))
+
         clip_features = self.sem_seg_head.predictor.clip_model.encode_image(clip_images_resized, dense=True)
+
+        clip_features1 = self.sem_seg_head.predictor.clip_model.encode_image(clip_images_resized_90, dense=True)
+        clip_features2 = self.sem_seg_head.predictor.clip_model.encode_image(clip_images_resized_180, dense=True)
+        clip_features3 = self.sem_seg_head.predictor.clip_model.encode_image(clip_images_resized_270, dense=True)
 
         image_features = clip_features[:, 1:, :]
 
@@ -156,11 +179,11 @@ class CATSeg(nn.Module):
         res5 = self.upsample2(res5)
         features = {'res5': res5, 'res4': res4, 'res3': res3,}
 
-        outputs = self.sem_seg_head(clip_features, features)
+        outputs = self.sem_seg_head([clip_features,clip_features1,clip_features2,clip_features3], features)
         if self.training:
             targets = torch.stack([x["sem_seg"].to(self.device) for x in batched_inputs], dim=0)
             outputs = F.interpolate(outputs, size=(targets.shape[-2], targets.shape[-1]), mode="bilinear", align_corners=False)
-            
+            # 整个模型里“真正的最终解码上采样”，直接决定每个像素的预测分辨率
             num_classes = outputs.shape[1]
             mask = targets != self.sem_seg_head.ignore_value
 
@@ -191,32 +214,56 @@ class CATSeg(nn.Module):
         unfold = nn.Unfold(kernel_size=kernel, stride=stride)
         fold = nn.Fold(out_res, kernel_size=kernel, stride=stride)
 
-        image = F.interpolate(images[0].unsqueeze(0), size=out_res, mode='bilinear', align_corners=False).squeeze()
-        image = rearrange(unfold(image), "(C H W) L-> L C H W", C=3, H=kernel)
-        global_image = F.interpolate(images[0].unsqueeze(0), size=(kernel, kernel), mode='bilinear', align_corners=False)
-        image = torch.cat((image, global_image), dim=0)
+        # 保持 4D (1,C,H,W)，不要 squeeze 掉 batch 维
+        image = F.interpolate(
+            images[0].unsqueeze(0), size=out_res, mode='bilinear', align_corners=False
+        )  # (1, C, H, W)
 
+        # (1, C*KH*KW, L) -> (L, C, KH, KW)
+        image = rearrange(unfold(image), "B (C H W) L -> (B L) C H W", C=3, H=kernel)
+
+        global_image = F.interpolate(
+            images[0].unsqueeze(0), size=(kernel, kernel), mode='bilinear', align_corners=False
+        )  # (1, C, KH, KW)
+        image = torch.cat((image, global_image), dim=0)  # (L+1, C, KH, KW)
+
+        # 归一化
         images = (image - self.pixel_mean) / self.pixel_std
         clip_images = (image - self.clip_pixel_mean) / self.clip_pixel_std
-        clip_images = F.interpolate(clip_images, size=self.clip_resolution, mode='bilinear', align_corners=False, )
+        clip_images = F.interpolate(clip_images, size=self.clip_resolution, mode='bilinear', align_corners=False)
+
+        # 旋转增强
+        clip_images_90 = torch.rot90(clip_images, k=1, dims=(2, 3))
+        clip_images_180  = torch.rot90(clip_images, k=2, dims=(2, 3))
+        clip_images_270 = torch.rot90(clip_images, k=3, dims=(2, 3))
         
         self.layers = []
-        clip_features = self.sem_seg_head.predictor.clip_model.encode_image(clip_images, dense=True)
+        clip_features  = self.sem_seg_head.predictor.clip_model.encode_image(clip_images,     dense=True)
+        clip_features1 = self.sem_seg_head.predictor.clip_model.encode_image(clip_images_90,  dense=True)
+        clip_features2 = self.sem_seg_head.predictor.clip_model.encode_image(clip_images_180, dense=True)
+        clip_features3 = self.sem_seg_head.predictor.clip_model.encode_image(clip_images_270, dense=True)
+
         res3 = rearrange(clip_features[:, 1:, :], "B (H W) C -> B C H W", H=24)
         res4 = self.upsample1(rearrange(self.layers[0][1:, :, :], "(H W) B C -> B C H W", H=24))
         res5 = self.upsample2(rearrange(self.layers[1][1:, :, :], "(H W) B C -> B C H W", H=24))
-
         features = {'res5': res5, 'res4': res4, 'res3': res3,}
-        outputs = self.sem_seg_head(clip_features, features)
+        outputs = self.sem_seg_head([clip_features, clip_features1, clip_features2, clip_features3], features)
 
+        # 每个 patch 的分割输出 -> (L+1, C, KH, KW)
         outputs = F.interpolate(outputs, size=kernel, mode="bilinear", align_corners=False)
         outputs = outputs.sigmoid()
         
-        global_output = outputs[-1:]
-        global_output = F.interpolate(global_output, size=out_res, mode='bilinear', align_corners=False,)
-        outputs = outputs[:-1]
-        outputs = fold(outputs.flatten(1).T) / fold(unfold(torch.ones([1] + out_res, device=self.device)))
-        outputs = (outputs + global_output) / 2.
+        # 最后一张是全局图
+        global_output = outputs[-1:]  # (1, C, KH, KW)
+        global_output = F.interpolate(global_output, size=out_res, mode='bilinear', align_corners=False)
+
+        # 其余为局部窗口，fold 回原图大小
+        outputs_local = outputs[:-1]  # (L, C, KH, KW)
+        aggregated = fold(rearrange(outputs_local, "L C H W -> 1 (C H W) L"))  # (1, C, H, W)
+        norm = fold(unfold(torch.ones((1, 1, out_res[0], out_res[1]), device=self.device))).clamp_min(1e-6)  # (1,1,H,W)
+        outputs = aggregated / norm
+
+        outputs = (outputs + global_output) / 2.0
 
         height = batched_inputs[0].get("height", out_res[0])
         width = batched_inputs[0].get("width", out_res[1])

@@ -43,5 +43,5 @@ def register_Vaihingen(root):
             **meta,
         )
 
-root = "/code/OVS_datasets"
+root = "datasets/OVSISBenchDataset"
 register_Vaihingen(root)

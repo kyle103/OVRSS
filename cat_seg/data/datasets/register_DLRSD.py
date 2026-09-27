@@ -56,5 +56,5 @@ def register_DLRSD(root):
             **meta,
         )
 
-root = "/code/OVS_datasets"  # 替换为DLRSD数据集的根目录
+root = "datasets/OVSISBenchDataset"  # 替换为DLRSD数据集的根目录
 register_DLRSD(root)

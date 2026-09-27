@@ -37,8 +37,8 @@ def _get_iSAID_meta():
 def register_iSAID(root):
     meta = _get_iSAID_meta()
     for name, image_dirname, sem_seg_dirname in [
-        ("train", "iSAID_split/train/imgs", "iSAID_split/train/D2masks"),
-        ("val", "iSAID_split/val/imgs", "iSAID_split/val/D2masks"),
+        ("train", "iSAID_split/train/images", "iSAID_split/train/D2masks"),
+        ("val", "iSAID_split/val/images", "iSAID_split/val/D2masks"),
         ("all", "iSAID/imgs", "iSAID/D2masks"),
     ]:
         image_dir = os.path.join(root, image_dirname)
@@ -55,5 +55,5 @@ def register_iSAID(root):
             **meta,
         )
 
-root = "/code/OVS_datasets"
+root = "datasets/OVSISBenchDataset"
 register_iSAID(root)

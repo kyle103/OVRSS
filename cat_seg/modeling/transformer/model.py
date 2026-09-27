@@ -3,7 +3,7 @@
 # Licensed under The MIT License [see LICENSE for details]
 # Written by Seokju Cho and Heeseong Shin
 # --------------------------------------------------------
-
+# model_RALA
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -82,6 +82,33 @@ class WindowAttention(nn.Module):
         self.proj_drop = nn.Dropout(proj_drop)
 
         self.softmax = nn.Softmax(dim=-1)
+                # --- Relative Position Bias (Swin) ---
+        Wh, Ww = self.window_size
+        num_relative_distance = (2 * Wh - 1) * (2 * Ww - 1)
+        self.relative_position_bias_table = nn.Parameter(
+            torch.zeros(num_relative_distance, num_heads)
+        )
+
+        # get pair-wise relative position index for each token inside the window
+        coords_h = torch.arange(Wh)
+        coords_w = torch.arange(Ww)
+        # torch.meshgrid 在不同版本 torch 的 indexing 参数可能不同，做一个兼容写法
+        try:
+            coords = torch.stack(torch.meshgrid(coords_h, coords_w, indexing='ij'))  # 2, Wh, Ww
+        except TypeError:
+            coords = torch.stack(torch.meshgrid(coords_h, coords_w))  # 2, Wh, Ww
+
+        coords_flatten = torch.flatten(coords, 1)  # 2, Wh*Ww
+        relative_coords = coords_flatten[:, :, None] - coords_flatten[:, None, :]  # 2, N, N
+        relative_coords = relative_coords.permute(1, 2, 0).contiguous()  # N, N, 2
+        relative_coords[:, :, 0] += Wh - 1
+        relative_coords[:, :, 1] += Ww - 1
+        relative_coords[:, :, 0] *= 2 * Ww - 1
+        relative_position_index = relative_coords.sum(-1)  # N, N
+        self.register_buffer("relative_position_index", relative_position_index)
+
+        trunc_normal_(self.relative_position_bias_table, std=0.02)
+
 
     def forward(self, x, mask=None):
         """
@@ -97,6 +124,12 @@ class WindowAttention(nn.Module):
 
         q = q * self.scale
         attn = (q @ k.transpose(-2, -1))
+                # --- add relative position bias ---
+        relative_position_bias = self.relative_position_bias_table[
+            self.relative_position_index.view(-1)
+        ].view(N, N, -1)  # N, N, num_heads
+        relative_position_bias = relative_position_bias.permute(2, 0, 1).contiguous()  # num_heads, N, N
+        attn = attn + relative_position_bias.unsqueeze(0)  # B_, num_heads, N, N
 
         if mask is not None:
             num_win = mask.shape[0]
@@ -251,39 +284,72 @@ class SwinTransformerBlockWrapper(nn.Module):
         x = self.block_2(x, appearance_guidance)
         x = rearrange(x, '(B T) (H W) C -> B C T H W', B=B, T=T, H=H, W=W)
         return x
-
+# spatial end
 
 def elu_feature_map(x):
     return torch.nn.functional.elu(x) + 1
 
 
 class LinearAttention(nn.Module):
+    """
+    RALA-style Rank-Augmented Linear Attention（序列版）
+    输入输出接口保持与原实现一致：
+      - queries: [B, L, H, D]
+      - keys:    [B, S, H, D]
+      - values:  [B, S, H, D]
+    返回:
+      - out:     [B, L, H, D]
+    """
     def __init__(self, eps=1e-6):
         super().__init__()
-        self.feature_map = elu_feature_map
         self.eps = eps
 
     def forward(self, queries, keys, values):
-        """ Multi-Head linear attention proposed in "Transformers are RNNs"
-        Args:
-            queries: [N, L, H, D]
-            keys: [N, S, H, D]
-            values: [N, S, H, D]
-            q_mask: [N, L]
-            kv_mask: [N, S]
-        Returns:
-            queried_values: (N, L, H, D)
-        """
-        Q = self.feature_map(queries)
-        K = self.feature_map(keys)
+        B, L, H, D = queries.shape
+        _, S, _, _ = keys.shape   # 通常 S == L == 类别数/ pad_len
 
-        v_length = values.size(1)
-        values = values / v_length  # prevent fp16 overflow
-        KV = torch.einsum("nshd,nshv->nhdv", K, values)  # (S,D)' @ S,V
-        Z = 1 / (torch.einsum("nlhd,nhd->nlh", Q, K.sum(dim=1)) + self.eps)
-        queried_values = torch.einsum("nlhd,nhdv,nlh->nlhv", Q, KV, Z) * v_length
+        # 1) φ(x) = ELU(x) + 1，保持和原来 LinearAttention 的特征映射一致
+        Q = F.elu(queries) + 1.0      # [B, L, H, D]
+        K = F.elu(keys) + 1.0         # [B, S, H, D]
+        V = values                    # [B, S, H, D]
 
-        return queried_values.contiguous()
+        # 2) 调整维度到 [B, H, L, D] / [B, H, S, D] 方便按 head 计算
+        Qh = Q.permute(0, 2, 1, 3)    # [B, H, L, D]
+        Kh = K.permute(0, 2, 1, 3)    # [B, H, S, D]
+        Vh = V.permute(0, 2, 1, 3)    # [B, H, S, D]
+
+        # --------------------------------
+        # Step A: 抬高 KV buffer 的秩（内容自适应权重）
+        # --------------------------------
+        scale = D ** -0.5
+        # 用所有 query 的均值做 “global query”
+        q_mean = Qh.mean(dim=2, keepdim=True)                     # [B, H, 1, D]
+        # 对每个 key_j 打分：<q_mean, k_j>
+        score = scale * torch.einsum('bhld,bhsd->bhls', q_mean, Kh)  # [B, H, 1, S]
+        eff = torch.softmax(score, dim=-1).transpose(-1, -2)         # [B, H, S, 1]
+
+        # 对 K 做加权，相当于给 KV 缓冲做内容相关重排，提升秩
+        Kh = Kh * eff * S                                            # [B, H, S, D]
+
+        # --------------------------------
+        # Step B: 线性注意力形式的归一化 & 输出
+        # --------------------------------
+        # 构造 D×D 的 KV buffer（和 GateLinearAttention 里 (H*W)^(-0.5) 类似）
+        len_scale = S ** -0.5
+        kv = (Kh.transpose(-2, -1) * len_scale) @ (Vh * len_scale)   # [B, H, D, D]
+
+        # normalizer z = 1 / (Q · mean(K))
+        K_mean = Kh.mean(dim=2, keepdim=True)                        # [B, H, 1, D]
+        z_denom = torch.einsum('bhld,bhnd->bhln', Qh, K_mean)        # [B, H, L, 1]
+        z = 1.0 / (z_denom + self.eps)                               # [B, H, L, 1]
+
+        # 最终输出：Q · KV ，再乘以 z 做归一化
+        out = torch.einsum('bhld,bhdf->bhlf', Qh, kv) * z            # [B, H, L, D]
+
+        # 调回 [B, L, H, D]，保证和原实现完全对齐
+        out = out.permute(0, 2, 1, 3).contiguous()
+        return out
+
 
 
 class FullAttention(nn.Module):
@@ -545,14 +611,151 @@ class Up(nn.Module):
 
         self.up = nn.ConvTranspose2d(in_channels, in_channels - guidance_channels, kernel_size=2, stride=2)
         self.conv = DoubleConv(in_channels, out_channels)
-
+        self.cconv = nn.Conv2d(in_channels - guidance_channels, guidance_channels, kernel_size=1, stride=1, padding=0)
+        self.sconv = nn.Conv2d(1, 1, kernel_size=1, stride=1, padding=0)
     def forward(self, x, guidance=None):
         x = self.up(x)
+
         if guidance is not None:
             T = x.size(0) // guidance.size(0)
+            attention = x.view(guidance.size(0),T,x.size(1),guidance.size(2),guidance.size(3)).mean(dim=1)
+            channel_attention = attention.mean(dim=[2,3],keepdim=True)
+            spatial_attention = attention.mean(dim=1,keepdim=True)
+            
+            channel_attention = self.cconv(channel_attention)
+            spatial_attention = self.sconv(spatial_attention)
+
+            guidance = channel_attention*guidance + spatial_attention*guidance + guidance
+            
             guidance = repeat(guidance, "B C H W -> (B T) C H W", T=T)
             x = torch.cat([x, guidance], dim=1)
         return self.conv(x)
+# class Up(nn.Module):
+#     """
+#     改进版 Upsampling：
+#     - 仍然是 ConvTranspose2d 上采样
+#     - 显式做 CLIP 样式的 global bias 消除 (guidance - global_mean)
+#     - 通道 SE 注意力 + 空间注意力，带 Sigmoid 约束
+#     - x -> guidance 的 cross-gating
+#     - 额外的 depthwise-like refine 分支，专门学形状/边界
+#     """
+
+#     def __init__(self, in_channels, out_channels, guidance_channels,
+#                  attn_reduction=4):
+#         super().__init__()
+
+#         # 1) 上采样：保持和原 Up 完全一致的接口
+#         self.up = nn.ConvTranspose2d(
+#             in_channels,
+#             in_channels - guidance_channels,
+#             kernel_size=2,
+#             stride=2
+#         )
+
+#         fused_channels = in_channels              # (in - g) + g
+#         self.guidance_channels = guidance_channels
+
+#         # 2) 通道注意力 (SE-style, 带 Sigmoid)
+#         mid_c = max(guidance_channels // attn_reduction, 8) if guidance_channels > 0 else 8
+#         if guidance_channels > 0:
+#             self.channel_mlp = nn.Sequential(
+#                 nn.Conv2d(guidance_channels, mid_c, kernel_size=1),
+#                 nn.ReLU(inplace=True),
+#                 nn.Conv2d(mid_c, guidance_channels, kernel_size=1),
+#                 nn.Sigmoid()
+#             )
+#         else:
+#             self.channel_mlp = None
+
+#         # 3) 空间注意力：用 x 生成 1 通道注意图，再 3×3 Conv + Sigmoid
+#         self.spatial_conv = nn.Sequential(
+#             nn.Conv2d(1, 1, kernel_size=3, padding=1),
+#             nn.Sigmoid()
+#         )
+
+#         # 4) cross-gating：用上采样后的 x 去 gate guidance
+#         if guidance_channels > 0:
+#             self.cross_gate = nn.Sequential(
+#                 nn.Conv2d(in_channels - guidance_channels,
+#                           guidance_channels,
+#                           kernel_size=1),
+#                 nn.Sigmoid()
+#             )
+#         else:
+#             self.cross_gate = None
+
+#         # 5) 残差 refine 分支：专门学局部形状 / 边界
+#         groups = max(fused_channels // 32, 1)     # 保证可整除
+#         self.refine = nn.Sequential(
+#             nn.Conv2d(fused_channels, fused_channels,
+#                       kernel_size=3, padding=1,
+#                       groups=groups, bias=False),
+#             nn.ReLU(inplace=True),
+#             nn.Conv2d(fused_channels, fused_channels,
+#                       kernel_size=3, padding=1,
+#                       groups=groups, bias=False),
+#         )
+
+#         # 6) 最终 DoubleConv 输出，保持原模型不变
+#         self.conv = DoubleConv(fused_channels, out_channels)
+
+#     def forward(self, x, guidance=None):
+#         """
+#         x:        (B*T, C_in, H_l, W_l)
+#         guidance: (B,   C_g,  H_h, W_h)
+#         """
+#         # --- Step0: 上采样 ---
+#         x = self.up(x)  # (B*T, C_u, H_h, W_h)
+#         B_T, C_u, H, W = x.shape
+
+#         if guidance is not None and self.guidance_channels > 0:
+#             B, Cg, Hg, Wg = guidance.shape
+#             assert H == Hg and W == Wg, "x & guidance spatial size mismatch"
+#             assert Cg == self.guidance_channels, "guidance_channels mismatch"
+#             T = B_T // B
+
+#             # 还原时间维
+#             x_bt = x.view(B, T, C_u, H, W)
+
+#             # --- Step1: Global Bias Alleviation (SimFeatUp 思想) ---
+#             # guidance 拆成 global + local，减掉 global 作为偏置
+#             g_global = guidance.mean(dim=(2, 3), keepdim=True)  # (B, Cg, 1, 1)
+#             g_local = guidance - g_global                       # 去全局偏置
+
+#             # --- Step2: 通道注意力 (SE) ---
+#             if self.channel_mlp is not None:
+#                 ch_ctx = g_local.mean(dim=(2, 3), keepdim=True)     # (B, Cg, 1, 1)
+#                 ch_weight = self.channel_mlp(ch_ctx)                # [0,1]
+#                 g_ch = g_local * ch_weight
+#             else:
+#                 g_ch = g_local
+
+#             # --- Step3: 空间注意力：用 x 的上下文生成 ---
+#             x_ctx = x_bt.mean(dim=1)                # (B, C_u, H, W)
+#             spa = x_ctx.mean(dim=1, keepdim=True)   # (B, 1, H, W)
+#             spa_weight = self.spatial_conv(spa)     # (B, 1, H, W) in [0,1]
+#             g_spa = g_ch * spa_weight               # 通道+空间调制
+
+#             # --- Step4: cross-gating：再用 x gate 一次 guidance ---
+#             if self.cross_gate is not None:
+#                 gate = self.cross_gate(x_ctx)       # (B, Cg, H, W) in [0,1]
+#                 g_fused = g_spa * (1.0 + gate)      # >1 表示增强
+#             else:
+#                 g_fused = g_spa
+
+#             # --- Step5: 展开回 (B*T, C_g, H, W) 并拼接 ---
+#             g_rep = repeat(g_fused, "B C H W -> (B T) C H W", T=T)
+#             x_cat = torch.cat([x, g_rep], dim=1)    # (B*T, C_u + C_g, H, W)
+#         else:
+#             x_cat = x
+
+#         # --- Step6: 残差 refine 分支：学习 Δ特征 修边界 ---
+#         residual = self.refine(x_cat)
+#         x_cat = x_cat + residual
+
+#         # --- Step7: DoubleConv 输出 ---
+#         out = self.conv(x_cat)
+#         return out
 
 
 class Aggregator(nn.Module):
@@ -610,7 +813,7 @@ class Aggregator(nn.Module):
             ) for _ in range(num_layers)
         ])
 
-        self.conv1 = nn.Conv2d(prompt_channel, hidden_dim, kernel_size=7, stride=1, padding=3)
+        self.conv1 = nn.Conv2d(prompt_channel*4, hidden_dim, kernel_size=7, stride=1, padding=3)
 
         self.guidance_projection = nn.Sequential(
             nn.Conv2d(appearance_guidance_dim, appearance_guidance_proj_dim, kernel_size=3, stride=1, padding=1),
@@ -646,9 +849,19 @@ class Aggregator(nn.Module):
         return torch.cat((img_feats, text_feats), dim=1) # B 2C T H W
 
     def correlation(self, img_feats, text_feats):
-        img_feats = F.normalize(img_feats, dim=1) # B C H W
+        img_feats0 = F.normalize(img_feats[0], dim=1) # B C H W
+        img_feats1 = F.normalize(img_feats[1], dim=1) # B C H W
+        img_feats2 = F.normalize(img_feats[2], dim=1) # B C H W
+        img_feats3 = F.normalize(img_feats[3], dim=1) # B C H W
+        img_feats1= torch.rot90(img_feats1, k=3, dims=(2, 3))
+        img_feats2 = torch.rot90(img_feats2, k=2, dims=(2, 3))
+        img_feats3 = torch.rot90(img_feats3, k=1, dims=(2, 3))
+
+        img_feats = torch.cat((img_feats0.unsqueeze(dim=1),img_feats1.unsqueeze(dim=1),img_feats2.unsqueeze(dim=1),img_feats3.unsqueeze(dim=1)),dim=1)
+
         text_feats = F.normalize(text_feats, dim=-1) # B T P C
-        corr = torch.einsum('bchw, btpc -> bpthw', img_feats, text_feats)
+        corr = torch.einsum('bnchw, btpc -> bnpthw', img_feats, text_feats)
+        corr = rearrange(corr, 'B N P T H W -> B (N P) T H W')
         return corr
 
     def corr_embed(self, x):
@@ -690,16 +903,63 @@ class Aggregator(nn.Module):
         classes = None
 
         corr = self.correlation(img_feats, text_feats)
-        if self.pad_len > 0 and text_feats.size(1) > self.pad_len:
-            avg = corr.permute(0, 2, 1, 3, 4).flatten(-3).max(dim=-1)[0] 
+        if self.pad_len > 0 and text_feats.size(1) > self.pad_len: #B (N P) T H W 
+            avg = corr.permute(0, 2, 1, 3, 4).flatten(-3).max(dim=-1)[0]  #B  T (N P) H W 
             classes = avg.topk(self.pad_len, dim=-1, sorted=False)[1]
             th_text = F.normalize(text_feats, dim=-1)
             th_text = torch.gather(th_text, dim=1, index=classes[..., None, None].expand(-1, -1, th_text.size(-2), th_text.size(-1)))
             orig_clases = text_feats.size(1)
-            img_feats = F.normalize(img_feats, dim=1) # B C H W
+            # img_feats = F.normalize(img_feats, dim=1) # B C H W
+            img_feats0 = F.normalize(img_feats[0], dim=1) # B C H W
+            img_feats1 = F.normalize(img_feats[1], dim=1) # B C H W
+            img_feats2 = F.normalize(img_feats[2], dim=1) # B C H W
+            img_feats3 = F.normalize(img_feats[3], dim=1) # B C H W
+            img_feats1= torch.rot90(img_feats1, k=3, dims=(2, 3))
+            img_feats2 = torch.rot90(img_feats2, k=2, dims=(2, 3))
+            img_feats3 = torch.rot90(img_feats3, k=1, dims=(2, 3))
+
+            img_feats = torch.cat((img_feats0.unsqueeze(dim=1),img_feats1.unsqueeze(dim=1),img_feats2.unsqueeze(dim=1),img_feats3.unsqueeze(dim=1)),dim=1)
             text_feats = th_text
-            corr = torch.einsum('bchw, btpc -> bpthw', img_feats, th_text)
-        #corr = self.feature_map(img_feats, text_feats)
+            corr = torch.einsum('bnchw, btpc -> bnpthw', img_feats, text_feats)
+            corr = rearrange(corr, 'B N P T H W -> B (N P) T H W')
+
+            # text_feats = th_text
+            # corr1 = torch.einsum('bchw, btpc -> bpthw', img_feats, th_text)
+
+        # corr2 = self.correlation(img_feats[1], text_feats)
+        # if self.pad_len > 0 and text_feats.size(1) > self.pad_len:
+        #     avg = corr2.permute(0, 2, 1, 3, 4).flatten(-3).max(dim=-1)[0] 
+        #     classes = avg.topk(self.pad_len, dim=-1, sorted=False)[1]
+        #     th_text = F.normalize(text_feats, dim=-1)
+        #     th_text = torch.gather(th_text, dim=1, index=classes[..., None, None].expand(-1, -1, th_text.size(-2), th_text.size(-1)))
+        #     orig_clases = text_feats.size(1)
+        #     img_feats = F.normalize(img_feats, dim=1) # B C H W
+        #     text_feats = th_text
+        #     corr2 = torch.einsum('bchw, btpc -> bpthw', img_feats, th_text)
+
+        # corr3 = self.correlation(img_feats[2], text_feats)
+        # if self.pad_len > 0 and text_feats.size(1) > self.pad_len:
+        #     avg = corr3.permute(0, 2, 1, 3, 4).flatten(-3).max(dim=-1)[0] 
+        #     classes = avg.topk(self.pad_len, dim=-1, sorted=False)[1]
+        #     th_text = F.normalize(text_feats, dim=-1)
+        #     th_text = torch.gather(th_text, dim=1, index=classes[..., None, None].expand(-1, -1, th_text.size(-2), th_text.size(-1)))
+        #     orig_clases = text_feats.size(1)
+        #     img_feats = F.normalize(img_feats, dim=1) # B C H W
+        #     text_feats = th_text
+        #     corr3 = torch.einsum('bchw, btpc -> bpthw', img_feats, th_text)
+
+        # corr4 = self.correlation(img_feats[3], text_feats)
+        # if self.pad_len > 0 and text_feats.size(1) > self.pad_len:
+        #     avg = corr4.permute(0, 2, 1, 3, 4).flatten(-3).max(dim=-1)[0] 
+        #     classes = avg.topk(self.pad_len, dim=-1, sorted=False)[1]
+        #     th_text = F.normalize(text_feats, dim=-1)
+        #     th_text = torch.gather(th_text, dim=1, index=classes[..., None, None].expand(-1, -1, th_text.size(-2), th_text.size(-1)))
+        #     orig_clases = text_feats.size(1)
+        #     img_feats = F.normalize(img_feats, dim=1) # B C H W
+        #     text_feats = th_text
+        #     corr4 = torch.einsum('bchw, btpc -> bpthw', img_feats, th_text)
+    
+
         corr_embed = self.corr_embed(corr)
 
         projected_guidance, projected_text_guidance, projected_decoder_guidance = None, None, [None, None]

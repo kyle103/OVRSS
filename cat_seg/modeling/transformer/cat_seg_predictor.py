@@ -11,7 +11,7 @@ from torch.nn import functional as F
 from detectron2.config import configurable
 from detectron2.layers import Conv2d
 
-from .model import Aggregator
+from .model_lrsa_fdam import Aggregator
 from cat_seg.third_party import clip
 from cat_seg.third_party import imagenet_templates
 
@@ -154,7 +154,7 @@ class CATSegPredictor(nn.Module):
         text = [text[c] for c in gt_cls] if gt_cls is not None else text
         text = self.get_text_embeds(text, self.prompt_templates, self.clip_model, prompt)
         
-        text = text.repeat(x.shape[0], 1, 1, 1)
+        text = text.repeat(x[0].shape[0], 1, 1, 1)
         out = self.transformer(x, text, vis)
         return out
 

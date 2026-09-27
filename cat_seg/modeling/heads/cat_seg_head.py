@@ -59,5 +59,8 @@ class CATSegHead(nn.Module):
             img_feats: (B, C, HW)
             guidance_features: (B, C, )
         """
-        img_feat = rearrange(features[:, 1:, :], "b (h w) c->b c h w", h=self.feature_resolution[0], w=self.feature_resolution[1])
-        return self.predictor(img_feat, guidance_features, prompt, gt_cls)
+        img_feat = rearrange(features[0][:, 1:, :], "b (h w) c->b c h w", h=self.feature_resolution[0], w=self.feature_resolution[1])
+        img_feat1 = rearrange(features[1][:, 1:, :], "b (h w) c->b c h w", h=self.feature_resolution[0], w=self.feature_resolution[1])
+        img_feat2 = rearrange(features[2][:, 1:, :], "b (h w) c->b c h w", h=self.feature_resolution[0], w=self.feature_resolution[1])
+        img_feat3 = rearrange(features[3][:, 1:, :], "b (h w) c->b c h w", h=self.feature_resolution[0], w=self.feature_resolution[1])
+        return self.predictor([img_feat,img_feat1,img_feat2,img_feat3], guidance_features, prompt, gt_cls)

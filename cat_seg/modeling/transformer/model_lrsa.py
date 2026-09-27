@@ -15,242 +15,502 @@ from timm.layers import PatchEmbed, Mlp, DropPath, to_2tuple, to_ntuple, trunc_n
 
 # Modified Swin Transformer blocks for guidance implementetion
 # https://github.com/microsoft/Swin-Transformer/blob/main/models/swin_transformer.py
-def window_partition(x, window_size: int):
+# --------------------------------------------------------
+# Spatial refinement (Replace Swin with LRSA + DWConv)
+# Keep the same wrapper name / interface for minimal changes
+# --------------------------------------------------------
+
+class IRB(nn.Module):
     """
-    Args:
-        x: (B, H, W, C)
-        window_size (int): window size
-
-    Returns:
-        windows: (num_windows*B, window_size, window_size, C)
+    Same IRB as LRFormer:
+      1x1 conv -> GELU -> (x + DWConv(x)) -> 1x1 conv
+    Input/Output are token format (B, N, C), requires (H, W) to reshape.
     """
-    B, H, W, C = x.shape
-    x = x.view(B, H // window_size, window_size, W // window_size, window_size, C)
-    windows = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(-1, window_size, window_size, C)
-    return windows
-
-
-def window_reverse(windows, window_size: int, H: int, W: int):
-    """
-    Args:
-        windows: (num_windows*B, window_size, window_size, C)
-        window_size (int): Window size
-        H (int): Height of image
-        W (int): Width of image
-
-    Returns:
-        x: (B, H, W, C)
-    """
-    B = int(windows.shape[0] / (H * W / window_size / window_size))
-    x = windows.view(B, H // window_size, W // window_size, window_size, window_size, -1)
-    x = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(B, H, W, -1)
-    return x
-
-
-
-class WindowAttention(nn.Module):
-    r""" Window based multi-head self attention (W-MSA) module with relative position bias.
-    It supports both of shifted and non-shifted window.
-
-    Args:
-        dim (int): Number of input channels.
-        num_heads (int): Number of attention heads.
-        head_dim (int): Number of channels per head (dim // num_heads if not set)
-        window_size (tuple[int]): The height and width of the window.
-        qkv_bias (bool, optional):  If True, add a learnable bias to query, key, value. Default: True
-        attn_drop (float, optional): Dropout ratio of attention weight. Default: 0.0
-        proj_drop (float, optional): Dropout ratio of output. Default: 0.0
-    """
-
-    def __init__(self, dim, appearance_guidance_dim, num_heads, head_dim=None, window_size=7, qkv_bias=True, attn_drop=0., proj_drop=0.):
-
+    def __init__(self, in_features, hidden_features=None, out_features=None, ksize=3,
+                 act_layer=nn.GELU, extra_act=False, drop=0.):
         super().__init__()
-        self.dim = dim
-        self.window_size = to_2tuple(window_size)  # Wh, Ww
-        win_h, win_w = self.window_size
-        self.window_area = win_h * win_w
-        self.num_heads = num_heads
-        head_dim = head_dim or dim // num_heads
-        attn_dim = head_dim * num_heads
-        self.scale = head_dim ** -0.5
+        out_features = out_features or in_features
+        hidden_features = hidden_features or in_features
 
-        self.q = nn.Linear(dim + appearance_guidance_dim, attn_dim, bias=qkv_bias)
-        self.k = nn.Linear(dim + appearance_guidance_dim, attn_dim, bias=qkv_bias)
-        self.v = nn.Linear(dim, attn_dim, bias=qkv_bias)
+        self.fc1 = nn.Conv2d(in_features, hidden_features, 1, 1, 0)
+        self.act = act_layer()
+        self.act1 = act_layer() if extra_act else nn.Identity()
+        self.conv = nn.Conv2d(hidden_features, hidden_features, kernel_size=ksize,
+                              padding=ksize // 2, stride=1, groups=hidden_features)
+        self.fc2 = nn.Conv2d(hidden_features, out_features, 1, 1, 0)
+        self.drop = nn.Dropout(drop)
+
+    def forward(self, x, H, W):
+        B, N, C = x.shape
+        x = x.permute(0, 2, 1).reshape(B, C, H, W)
+        x = self.fc1(x)
+        x = self.act(x)
+        x = x + self.conv(x)
+        x = self.fc2(x)
+        x = self.drop(x)
+        return x.reshape(B, -1, H * W).permute(0, 2, 1).contiguous()
+
+
+class GuidedPoolingAttention(nn.Module):
+    """
+    LRFormer PoolingAttention variant, adapted to CAT-Seg guidance injection:
+      - Q/K: concat([x, guidance]) -> Linear -> heads
+      - V  : x only -> Linear -> heads
+    K/V are built from pyramid pooled features (pooled_sizes), each enhanced by a DWConv (d_convs).
+    Optional q_pooled_size: pool Q as well, then upsample output back to (H,W).
+    """
+    def __init__(self, dim, guidance_dim, num_heads=2,
+                 qkv_bias=False, qk_scale=None,
+                 attn_drop=0., proj_drop=0.,
+                 pooled_sizes=(8, 6, 5, 3),
+                 q_pooled_size=1,
+                 q_conv=False):
+        super().__init__()
+        assert dim % num_heads == 0, f"dim {dim} should be divided by num_heads {num_heads}."
+
+        self.dim = dim
+        self.guidance_dim = int(guidance_dim)
+        self.num_heads = num_heads
+        head_dim = dim // num_heads
+        self.scale = qk_scale or head_dim ** -0.5
+
+        # Q/K take (dim + guidance_dim), V takes dim
+        self.q = nn.Linear(dim + self.guidance_dim, dim, bias=qkv_bias) if self.guidance_dim > 0 else nn.Linear(dim, dim, bias=qkv_bias)
+        self.k = nn.Linear(dim + self.guidance_dim, dim, bias=qkv_bias) if self.guidance_dim > 0 else nn.Linear(dim, dim, bias=qkv_bias)
+        self.v = nn.Linear(dim, dim, bias=qkv_bias)
+
         self.attn_drop = nn.Dropout(attn_drop)
-        self.proj = nn.Linear(attn_dim, dim)
+        self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
 
-        self.softmax = nn.Softmax(dim=-1)
+        self.pooled_sizes = list(pooled_sizes)
+        self.eps = 0.001
 
-    def forward(self, x, mask=None):
-        """
-        Args:
-            x: input features with shape of (num_windows*B, N, C)
-            mask: (0/-inf) mask with shape of (num_windows, Wh*Ww, Wh*Ww) or None
-        """
-        B_, N, C = x.shape
-        
-        q = self.q(x).reshape(B_, N, self.num_heads, -1).permute(0, 2, 1, 3)
-        k = self.k(x).reshape(B_, N, self.num_heads, -1).permute(0, 2, 1, 3)
-        v = self.v(x[:, :, :self.dim]).reshape(B_, N, self.num_heads, -1).permute(0, 2, 1, 3)
+        # normalize pooled x tokens (and pooled g tokens separately if needed)
+        self.norm_x = nn.LayerNorm(dim)
+        self.norm_g = nn.LayerNorm(self.guidance_dim) if self.guidance_dim > 0 else None
 
-        q = q * self.scale
-        attn = (q @ k.transpose(-2, -1))
+        self.q_pooled_size = int(q_pooled_size)
 
-        if mask is not None:
-            num_win = mask.shape[0]
-            attn = attn.view(B_ // num_win, num_win, self.num_heads, N, N) + mask.unsqueeze(1).unsqueeze(0)
-            attn = attn.view(-1, self.num_heads, N, N)
-            attn = self.softmax(attn)
+        # Optional q_conv branch (same spirit as LRFormer)
+        if q_conv and self.q_pooled_size > 1:
+            self.q_conv = nn.Conv2d(dim, dim, kernel_size=3, padding=1, stride=1, groups=dim)
+            self.q_norm = nn.LayerNorm(dim)
         else:
-            attn = self.softmax(attn)
+            self.q_conv = None
+            self.q_norm = None
 
+    def _aspect_pool_size(self, base, H, W):
+        # keep aspect ratio similar to LRFormer
+        if W >= H:
+            return (base, int(round(W * float(base) / H + self.eps)))
+        else:
+            return (int(round(H * float(base) / W + self.eps)), base)
+
+    def forward(self, x, H, W, guidance=None, d_convs=None):
+        """
+        x: (B, N, C), N=H*W
+        guidance: (B, N, Cg) or None
+        d_convs: list/ModuleList of DWConv layers, one per pooled_size
+        """
+        B, N, C = x.shape
+        H, W = int(H), int(W)
+
+        # -------- Q branch (optional pooling) --------
+        if self.q_pooled_size > 1:
+            q_size = self._aspect_pool_size(self.q_pooled_size, H, W)
+
+            x2d = x.transpose(1, 2).reshape(B, C, H, W)
+            q2d = F.adaptive_avg_pool2d(x2d, q_size)
+            _, _, Hq, Wq = q2d.shape
+
+            if self.q_conv is not None:
+                q2d = q2d + self.q_conv(q2d)
+                q_tok = self.q_norm(q2d.flatten(2).transpose(1, 2))  # (B, Hq*Wq, C)
+            else:
+                q_tok = q2d.flatten(2).transpose(1, 2)
+
+            if self.guidance_dim > 0:
+                if guidance is None:
+                    raise ValueError("guidance_dim > 0 but guidance is None")
+                g2d = guidance.transpose(1, 2).reshape(B, self.guidance_dim, H, W)
+                gq2d = F.adaptive_avg_pool2d(g2d, q_size)
+                gq_tok = gq2d.flatten(2).transpose(1, 2)
+                q_in = torch.cat([q_tok, gq_tok], dim=-1)
+            else:
+                q_in = q_tok
+
+            q = self.q(q_in).reshape(B, -1, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3).contiguous()
+            Lq = q.shape[2]
+        else:
+            if self.guidance_dim > 0:
+                if guidance is None:
+                    raise ValueError("guidance_dim > 0 but guidance is None")
+                q_in = torch.cat([x, guidance], dim=-1)
+            else:
+                q_in = x
+            q = self.q(q_in).reshape(B, -1, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3).contiguous()
+            Lq = N
+
+        # -------- Pyramid pooling for K/V --------
+        if d_convs is None:
+            # If not provided, fallback to identity (still works, but less faithful)
+            d_convs = [nn.Identity() for _ in self.pooled_sizes]
+
+        x2d = x.permute(0, 2, 1).reshape(B, C, H, W)
+        if self.guidance_dim > 0:
+            if guidance is None:
+                raise ValueError("guidance_dim > 0 but guidance is None")
+            g2d = guidance.permute(0, 2, 1).reshape(B, self.guidance_dim, H, W)
+        else:
+            g2d = None
+
+        pooled_x_list = []
+        pooled_g_list = []
+
+        for base, conv in zip(self.pooled_sizes, d_convs):
+            psize = self._aspect_pool_size(int(base), H, W)
+
+            px = F.adaptive_avg_pool2d(x2d, psize)
+            px = px + conv(px)  # LRFormer: pool + DWConv(pool)
+            pooled_x_list.append(px.flatten(2))  # (B, C, S)
+
+            if self.guidance_dim > 0:
+                pg = F.adaptive_avg_pool2d(g2d, psize)
+                pooled_g_list.append(pg.flatten(2))  # (B, Cg, S)
+
+        pooled_x = torch.cat(pooled_x_list, dim=2)  # (B, C, S_total)
+        pooled_x_tok = pooled_x.permute(0, 2, 1).contiguous()  # (B, S_total, C)
+        pooled_x_tok = self.norm_x(pooled_x_tok)
+
+        if self.guidance_dim > 0:
+            pooled_g = torch.cat(pooled_g_list, dim=2)  # (B, Cg, S_total)
+            pooled_g_tok = pooled_g.permute(0, 2, 1).contiguous()  # (B, S_total, Cg)
+            pooled_g_tok = self.norm_g(pooled_g_tok)
+            k_in = torch.cat([pooled_x_tok, pooled_g_tok], dim=-1)  # (B, S_total, C+Cg)
+        else:
+            k_in = pooled_x_tok
+
+        k = self.k(k_in).reshape(B, -1, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3).contiguous()
+        v = self.v(pooled_x_tok).reshape(B, -1, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3).contiguous()
+
+        # -------- Attention --------
+        attn = (q @ k.transpose(-2, -1)) * self.scale  # (B, h, Lq, S_total)
+        attn = attn.softmax(dim=-1)
         attn = self.attn_drop(attn)
 
-        x = (attn @ v).transpose(1, 2).reshape(B_, N, -1)
-        x = self.proj(x)
-        x = self.proj_drop(x)
-        return x
+        out = attn @ v  # (B, h, Lq, dh)
+        out = out.transpose(1, 2).reshape(B, Lq, C).contiguous()
+        out = self.proj_drop(self.proj(out))
+
+        # -------- Upsample for residual if q was pooled --------
+        if self.q_pooled_size > 1:
+            # out: (B, Hq*Wq, C) -> (B, C, Hq, Wq) -> upsample -> (B, H*W, C)
+            out2d = out.transpose(1, 2).reshape(B, C, Hq, Wq)
+            out2d = F.interpolate(out2d, size=(H, W), mode='bilinear', align_corners=True)
+            out = out2d.flatten(2).transpose(1, 2).contiguous()
+
+        # ensure output is (B, H*W, C)
+        if out.shape[1] != H * W:
+            raise RuntimeError(f"Unexpected out length: {out.shape[1]} vs H*W={H*W}")
+        return out
 
 
-class SwinTransformerBlock(nn.Module):
-    r""" Swin Transformer Block.
-
-    Args:
-        dim (int): Number of input channels.
-        input_resolution (tuple[int]): Input resulotion.
-        window_size (int): Window size.
-        num_heads (int): Number of attention heads.
-        head_dim (int): Enforce the number of channels per head
-        shift_size (int): Shift size for SW-MSA.
-        mlp_ratio (float): Ratio of mlp hidden dim to embedding dim.
-        qkv_bias (bool, optional): If True, add a learnable bias to query, key, value. Default: True
-        drop (float, optional): Dropout rate. Default: 0.0
-        attn_drop (float, optional): Attention dropout rate. Default: 0.0
-        drop_path (float, optional): Stochastic depth rate. Default: 0.0
-        act_layer (nn.Module, optional): Activation layer. Default: nn.GELU
-        norm_layer (nn.Module, optional): Normalization layer.  Default: nn.LayerNorm
+class LRSARefineBlock(nn.Module):
     """
-
-    def __init__(
-            self, dim, appearance_guidance_dim, input_resolution, num_heads=4, head_dim=None, window_size=7, shift_size=0,
-            mlp_ratio=4., qkv_bias=True, drop=0., attn_drop=0., drop_path=0.,
-            act_layer=nn.GELU, norm_layer=nn.LayerNorm):
+    LRFormer-style Block: (CPE) + PoolingAttention + IRB, with DropPath and optional LayerScale.
+    This is used to replace SwinTransformerBlock in CAT-Seg spatial refinement.
+    """
+    def __init__(self, dim, guidance_dim, num_heads,
+                 pooled_sizes=(8, 6, 5, 3),
+                 q_pooled_size=1,
+                 q_conv=False,
+                 mlp_ratio=4.0,
+                 qkv_bias=True,
+                 drop=0.0,
+                 attn_drop=0.0,
+                 drop_path=0.0,
+                 norm_layer=nn.LayerNorm,
+                 ls=False,
+                 extra_act=False,
+                 use_prenorm=False):
         super().__init__()
-        self.dim = dim
-        self.input_resolution = input_resolution
-        self.window_size = window_size
-        self.shift_size = shift_size
-        self.mlp_ratio = mlp_ratio
-        if min(self.input_resolution) <= self.window_size:
-            # if window size is larger than input resolution, we don't partition windows
-            self.shift_size = 0
-            self.window_size = min(self.input_resolution)
-        assert 0 <= self.shift_size < self.window_size, "shift_size must in 0-window_size"
+
+        self.pre_norm = nn.BatchNorm2d(dim) if use_prenorm else nn.Identity()
+
+        self.cpe = nn.Conv2d(dim, dim, 3, 1, 1, groups=dim)  # CPE (DWConv)
 
         self.norm1 = norm_layer(dim)
-        self.attn = WindowAttention(
-            dim, appearance_guidance_dim=appearance_guidance_dim, num_heads=num_heads, head_dim=head_dim, window_size=to_2tuple(self.window_size),
-            qkv_bias=qkv_bias, attn_drop=attn_drop, proj_drop=drop)
+        self.attn = GuidedPoolingAttention(
+            dim=dim,
+            guidance_dim=guidance_dim,
+            num_heads=num_heads,
+            qkv_bias=qkv_bias,
+            qk_scale=None,
+            attn_drop=attn_drop,
+            proj_drop=drop,
+            pooled_sizes=pooled_sizes,
+            q_pooled_size=q_pooled_size,
+            q_conv=q_conv,
+        )
 
-        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+        self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
+
         self.norm2 = norm_layer(dim)
-        self.mlp = Mlp(in_features=dim, hidden_features=int(dim * mlp_ratio), act_layer=act_layer, drop=drop)
+        self.mlp = IRB(in_features=dim, hidden_features=int(dim * mlp_ratio),
+                       act_layer=nn.GELU, drop=drop, ksize=3, extra_act=extra_act)
 
-        if self.shift_size > 0:
-            # calculate attention mask for SW-MSA
-            H, W = self.input_resolution
-            img_mask = torch.zeros((1, H, W, 1))  # 1 H W 1
-            cnt = 0
-            for h in (
-                    slice(0, -self.window_size),
-                    slice(-self.window_size, -self.shift_size),
-                    slice(-self.shift_size, None)):
-                for w in (
-                        slice(0, -self.window_size),
-                        slice(-self.window_size, -self.shift_size),
-                        slice(-self.shift_size, None)):
-                    img_mask[:, h, w, :] = cnt
-                    cnt += 1
-            mask_windows = window_partition(img_mask, self.window_size)  # num_win, window_size, window_size, 1
-            mask_windows = mask_windows.view(-1, self.window_size * self.window_size)
-            attn_mask = mask_windows.unsqueeze(1) - mask_windows.unsqueeze(2)
-            attn_mask = attn_mask.masked_fill(attn_mask != 0, float(-100.0)).masked_fill(attn_mask == 0, float(0.0))
+        self.ls = ls
+        if self.ls:
+            layer_scale_init_value = 1e-6
+            self.layer_scale_1 = nn.Parameter(layer_scale_init_value * torch.ones((dim)), requires_grad=True)
+            self.layer_scale_2 = nn.Parameter(layer_scale_init_value * torch.ones((dim)), requires_grad=True)
+
+        # per pooled size DWConvs (LRFormer: d_convsX passed in; here we internalize for CAT-Seg)
+        self.d_convs = nn.ModuleList([
+            nn.Conv2d(dim, dim, kernel_size=3, stride=1, padding=1, groups=dim) for _ in pooled_sizes
+        ])
+
+    def forward(self, x, H, W, guidance=None):
+        """
+        x: (B, H*W, C)
+        guidance: (B, H*W, Cg) or None
+        """
+        B, N, C = x.shape
+        assert N == H * W, "token length mismatch"
+
+        # CPE
+        x2d = x.permute(0, 2, 1).reshape(B, C, H, W)
+        x2d = self.pre_norm(x2d)
+        x2d = self.cpe(x2d) + x2d
+        x = x2d.flatten(2).transpose(1, 2).contiguous()
+
+        # Attention + IRB
+        if self.ls:
+            x = x + self.drop_path(self.layer_scale_1[None, None, :] *
+                                   self.attn(self.norm1(x), H, W, guidance=guidance, d_convs=self.d_convs))
+            x = x + self.drop_path(self.layer_scale_2[None, None, :] *
+                                   self.mlp(self.norm2(x), H, W))
         else:
-            attn_mask = None
-
-        self.register_buffer("attn_mask", attn_mask)
-
-    def forward(self, x, appearance_guidance):
-        H, W = self.input_resolution
-        B, L, C = x.shape
-        assert L == H * W, "input feature has wrong size"
-
-        shortcut = x
-        x = self.norm1(x)
-        x = x.view(B, H, W, C)
-        if appearance_guidance is not None:
-            appearance_guidance = appearance_guidance.view(B, H, W, -1)
-            x = torch.cat([x, appearance_guidance], dim=-1)
-
-        # cyclic shift
-        if self.shift_size > 0:
-            shifted_x = torch.roll(x, shifts=(-self.shift_size, -self.shift_size), dims=(1, 2))
-        else:
-            shifted_x = x
-
-        # partition windows
-        x_windows = window_partition(shifted_x, self.window_size)  # num_win*B, window_size, window_size, C
-        x_windows = x_windows.view(-1, self.window_size * self.window_size, x_windows.shape[-1])  # num_win*B, window_size*window_size, C
-
-        # W-MSA/SW-MSA
-        attn_windows = self.attn(x_windows, mask=self.attn_mask)  # num_win*B, window_size*window_size, C
-
-        # merge windows
-        attn_windows = attn_windows.view(-1, self.window_size, self.window_size, C)
-        shifted_x = window_reverse(attn_windows, self.window_size, H, W)  # B H' W' C
-
-        # reverse cyclic shift
-        if self.shift_size > 0:
-            x = torch.roll(shifted_x, shifts=(self.shift_size, self.shift_size), dims=(1, 2))
-        else:
-            x = shifted_x
-        x = x.view(B, H * W, C)
-
-        # FFN
-        x = shortcut + self.drop_path(x)
-        x = x + self.drop_path(self.mlp(self.norm2(x)))
+            x = x + self.drop_path(self.attn(self.norm1(x), H, W, guidance=guidance, d_convs=self.d_convs))
+            x = x + self.drop_path(self.mlp(self.norm2(x), H, W))
 
         return x
 
 
+# class SwinTransformerBlockWrapper(nn.Module):
+#     """
+#     Keep the original name / interface used by CAT-Seg.
+#     Replace internal Swin blocks with LRFormer-style LRSARefineBlock.
+
+#     Mapping from CAT-Seg config:
+#       WINDOW_SIZES (int)  -> here interpreted as q_pooled_size target (like LRFormer q_pooled_size).
+#       pooled_sizes        -> derived from LRFormer base [11,8,6,4] scaled by q_pooled_size/16.
+
+#     For your setting: feature_resolution=24, WINDOW_SIZES=12
+#       q_pooled_size = 12
+#       pooled_sizes = round([11,8,6,4] * 12/16) -> [8,6,5,3]
+#     """
+#     def __init__(self, dim, appearance_guidance_dim, input_resolution, nheads=4, window_size=12, pad_len=0):
+#         super().__init__()
+#         H, W = to_2tuple(input_resolution)
+
+#         if isinstance(window_size, (tuple, list)):
+#             window_size = window_size[0]
+#         q_pooled_size = int(window_size)
+#         q_pooled_size = max(1, min(q_pooled_size, max(H, W)))  # clamp
+
+#         base = [11, 8, 6, 4]
+#         pooled_sizes = [max(1, int(round(t * q_pooled_size / 16.0 + 0.001))) for t in base]
+#         pooled_sizes = [min(s, max(H, W)) for s in pooled_sizes]
+
+#         self.guidance_norm = nn.LayerNorm(appearance_guidance_dim) if appearance_guidance_dim > 0 else None
+
+#         self.block_1 = LRSARefineBlock(
+#             dim=dim, guidance_dim=appearance_guidance_dim,
+#             num_heads=nheads,
+#             pooled_sizes=pooled_sizes,
+#             q_pooled_size=q_pooled_size,
+#             q_conv=False,
+#             mlp_ratio=4.0,
+#             qkv_bias=True,
+#             drop=0.0, attn_drop=0.0, drop_path=0.0,
+#             norm_layer=nn.LayerNorm,
+#             ls=False,           # you can set True if you want LRFormer-like layerscale
+#             extra_act=False,
+#             use_prenorm=False,
+#         )
+#         self.block_2 = LRSARefineBlock(
+#             dim=dim, guidance_dim=appearance_guidance_dim,
+#             num_heads=nheads,
+#             pooled_sizes=pooled_sizes,
+#             q_pooled_size=q_pooled_size,
+#             q_conv=False,
+#             mlp_ratio=4.0,
+#             qkv_bias=True,
+#             drop=0.0, attn_drop=0.0, drop_path=0.0,
+#             norm_layer=nn.LayerNorm,
+#             ls=False,
+#             extra_act=False,
+#             use_prenorm=False,
+#         )
+
+#         self.pad_len = pad_len
+#         self.padding_tokens = nn.Parameter(torch.zeros(1, 1, dim)) if pad_len > 0 else None
+#         self.padding_guidance = nn.Parameter(torch.zeros(1, 1, appearance_guidance_dim)) if pad_len > 0 and appearance_guidance_dim > 0 else None
+
+#         self.input_resolution = (H, W)
+
+#     def forward(self, x, appearance_guidance):
+#         """
+#         x: B C T H W
+#         appearance_guidance: B Cg H W
+#         """
+#         B, C, T, H, W = x.shape
+#         assert (H, W) == self.input_resolution, f"Expected {self.input_resolution}, got {(H, W)}"
+
+#         x = rearrange(x, 'B C T H W -> (B T) (H W) C')
+
+#         g = None
+#         if appearance_guidance is not None:
+#             g = repeat(appearance_guidance, 'B C H W -> (B T) (H W) C', T=T)
+#             if self.guidance_norm is not None:
+#                 g = self.guidance_norm(g)
+
+#         x = self.block_1(x, H, W, guidance=g)
+#         x = self.block_2(x, H, W, guidance=g)
+
+#         x = rearrange(x, '(B T) (H W) C -> B C T H W', B=B, T=T, H=H, W=W)
+#         return x
+
 class SwinTransformerBlockWrapper(nn.Module):
-    def __init__(self, dim, appearance_guidance_dim, input_resolution, nheads=4, window_size=5, pad_len=0):
+    def __init__(
+        self,
+        dim,
+        appearance_guidance_dim,
+        input_resolution,
+        nheads=4,
+        window_size=12,
+        pad_len=0
+    ):
         super().__init__()
-        self.block_1 = SwinTransformerBlock(dim, appearance_guidance_dim, input_resolution, num_heads=nheads, head_dim=None, window_size=window_size, shift_size=0)
-        self.block_2 = SwinTransformerBlock(dim, appearance_guidance_dim, input_resolution, num_heads=nheads, head_dim=None, window_size=window_size, shift_size=window_size // 2)
+        H, W = to_2tuple(input_resolution)
+        R = max(H, W)
+
+        if isinstance(window_size, (tuple, list)):
+            window_size = window_size[0]
+
+        # ---- q1=q2 ----
+        q1 = int(window_size)
+        q1 = max(1, min(q1, R))
+        q2 = q1
+
+        # ---- pooled_sizes for block1 (保持你现在的推导) ----
+        base = [11, 8, 6, 4]
+        pooled1 = [max(1, int(round(t * q1 / 16.0 + 0.001))) for t in base]
+        pooled1 = [min(s, R) for s in pooled1]   # e.g. [8,6,5,3] for q1=12,R=24
+
+        # ---- pooled_sizes for block2: 更细一点（推荐）----
+        # 方案A：直接用 [12,8,6,4]（对 24x24 很合适）
+        pooled2 = [min(R, s) for s in [12, 8, 6, 4]]
+
+        # 方案B（可选）：在 pooled1 后面加一个更细 level（非常稳）
+        # pooled2 = pooled1 + [2]
+
         self.guidance_norm = nn.LayerNorm(appearance_guidance_dim) if appearance_guidance_dim > 0 else None
+
+        self.block_1 = LRSARefineBlock(
+            dim=dim,
+            guidance_dim=appearance_guidance_dim,
+            num_heads=nheads,
+            pooled_sizes=pooled1,
+            q_pooled_size=q1,
+            q_conv=False,          # block1 保持稳健
+            mlp_ratio=4.0,
+            qkv_bias=True,
+            drop=0.0,
+            attn_drop=0.0,
+            drop_path=0.0,
+            norm_layer=nn.LayerNorm,
+            ls=False,
+            extra_act=False,
+            use_prenorm=False,
+        )
+
+        self.block_2 = LRSARefineBlock(
+            dim=dim,
+            guidance_dim=appearance_guidance_dim,
+            num_heads=nheads,
+            pooled_sizes=pooled2,
+            q_pooled_size=q2,      # q2=q1
+            q_conv=True,           # 关键：打开
+            mlp_ratio=4.0,
+            qkv_bias=True,
+            drop=0.0,
+            attn_drop=0.0,
+            drop_path=0.0,
+            norm_layer=nn.LayerNorm,
+            ls=True,               # 推荐打开，抑制 block2 过强导致的噪声
+            extra_act=False,
+            use_prenorm=False,
+        )
+
+        # shift size (仿 Swin)
+        self.shift_size = int(window_size) // 2  # e.g. 6 for window_size=12
 
         self.pad_len = pad_len
         self.padding_tokens = nn.Parameter(torch.zeros(1, 1, dim)) if pad_len > 0 else None
-        self.padding_guidance = nn.Parameter(torch.zeros(1, 1, appearance_guidance_dim)) if pad_len > 0 and appearance_guidance_dim > 0 else None
-    
+        self.padding_guidance = (
+            nn.Parameter(torch.zeros(1, 1, appearance_guidance_dim))
+            if pad_len > 0 and appearance_guidance_dim > 0 else None
+        )
+        self.input_resolution = (H, W)
+
     def forward(self, x, appearance_guidance):
         """
-        Arguments:
-            x: B C T H W
-            appearance_guidance: B C H W
+        x: B C T H W
+        appearance_guidance: B Cg H W
         """
         B, C, T, H, W = x.shape
-        
+        assert (H, W) == self.input_resolution, f"Expected {self.input_resolution}, got {(H, W)}"
+
         x = rearrange(x, 'B C T H W -> (B T) (H W) C')
+
+        g = None
         if appearance_guidance is not None:
-            appearance_guidance = self.guidance_norm(repeat(appearance_guidance, 'B C H W -> (B T) (H W) C', T=T))
-        x = self.block_1(x, appearance_guidance)
-        x = self.block_2(x, appearance_guidance)
+            g = repeat(appearance_guidance, 'B C H W -> (B T) (H W) C', T=T)
+            if self.guidance_norm is not None:
+                g = self.guidance_norm(g)
+
+        # block1
+        x = self.block_1(x, H, W, guidance=g)
+
+        # ---- Swin-style shift for block2 ----
+        if self.shift_size > 0:
+            BT = x.shape[0]
+            x2d = x.view(BT, H, W, C)
+            x2d = torch.roll(x2d, shifts=(-self.shift_size, -self.shift_size), dims=(1, 2))
+            x = x2d.view(BT, H * W, C)
+
+            if g is not None:
+                Cg = g.shape[-1]
+                g2d = g.view(BT, H, W, Cg)
+                g2d = torch.roll(g2d, shifts=(-self.shift_size, -self.shift_size), dims=(1, 2))
+                g = g2d.view(BT, H * W, Cg)
+
+        x = self.block_2(x, H, W, guidance=g)
+
+        if self.shift_size > 0:
+            BT = x.shape[0]
+            x2d = x.view(BT, H, W, C)
+            x2d = torch.roll(x2d, shifts=(self.shift_size, self.shift_size), dims=(1, 2))
+            x = x2d.view(BT, H * W, C)
+
         x = rearrange(x, '(B T) (H W) C -> B C T H W', B=B, T=T, H=H, W=W)
         return x
+
+
+# spatial attention end
 
 
 def elu_feature_map(x):
@@ -545,11 +805,22 @@ class Up(nn.Module):
 
         self.up = nn.ConvTranspose2d(in_channels, in_channels - guidance_channels, kernel_size=2, stride=2)
         self.conv = DoubleConv(in_channels, out_channels)
-
+        self.cconv = nn.Conv2d(in_channels - guidance_channels, guidance_channels, kernel_size=1, stride=1, padding=0)
+        self.sconv = nn.Conv2d(1, 1, kernel_size=1, stride=1, padding=0)
     def forward(self, x, guidance=None):
         x = self.up(x)
+
         if guidance is not None:
             T = x.size(0) // guidance.size(0)
+            attention = x.view(guidance.size(0),T,x.size(1),guidance.size(2),guidance.size(3)).mean(dim=1)
+            channel_attention = attention.mean(dim=[2,3],keepdim=True)
+            spatial_attention = attention.mean(dim=1,keepdim=True)
+            
+            channel_attention = self.cconv(channel_attention)
+            spatial_attention = self.sconv(spatial_attention)
+
+            guidance = channel_attention*guidance + spatial_attention*guidance + guidance
+            
             guidance = repeat(guidance, "B C H W -> (B T) C H W", T=T)
             x = torch.cat([x, guidance], dim=1)
         return self.conv(x)
